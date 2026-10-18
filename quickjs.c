@@ -59593,6 +59593,27 @@ static bool array_buffer_is_resizable(const JSArrayBuffer *abuf)
     return abuf->max_byte_length >= 0;
 }
 
+int JS_ExchangeArrayBufferAllocator(JSContext *ctx, JSValueConst obj,
+    JSReallocArrayBufferDataFunc **realloc_func, void **opaque)
+{
+    JSArrayBuffer *abuf = js_get_array_buffer(ctx, obj);
+    JSReallocArrayBufferDataFunc *previous;
+    void *previous_opaque;
+    if (!abuf)
+        return -1;
+    if (abuf->detached || abuf->shared || !abuf->realloc_func) {
+        JS_ThrowTypeError(ctx, "Expected an attached, managed, non-shared ArrayBuffer");
+        return -1;
+    }
+    previous = abuf->realloc_func;
+    previous_opaque = abuf->opaque;
+    abuf->realloc_func = *realloc_func;
+    abuf->opaque = *opaque;
+    *realloc_func = previous;
+    *opaque = previous_opaque;
+    return 0;
+}
+
 static void js_array_buffer_update_typed_arrays(JSArrayBuffer *abuf)
 {
     uint32_t size_log2, size_elem;
@@ -60054,7 +60075,9 @@ JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
     if (pbyte_offset)
         *pbyte_offset = ta->offset;
     if (pbyte_length)
-        *pbyte_length = ta->length;
+        *pbyte_length = ta->track_rab
+            ? (size_t)p->u.array.count << typed_array_size_log2(p->class_id)
+            : ta->length;
     if (pbytes_per_element) {
         *pbytes_per_element = 1 << typed_array_size_log2(p->class_id);
     }
@@ -62144,6 +62167,32 @@ static JSObject *get_dataview(JSContext *ctx, JSValueConst this_val)
         return NULL;
     }
     return p;
+}
+
+JSValue JS_GetBufferRange(JSContext *ctx, JSValueConst obj,
+    size_t *offset, size_t *length)
+{
+    JSObject *p;
+    JSTypedArray *ta;
+    if (JS_IsArrayBuffer(obj)) {
+        JS_GetArrayBuffer(ctx, length, obj);
+        if (JS_HasException(ctx))
+            return JS_EXCEPTION;
+        *offset = 0;
+        return js_dup(obj);
+    }
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_DATAVIEW) {
+        p = get_dataview(ctx, obj);
+        if (dataview_is_oob(p))
+            return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+        ta = p->u.typed_array;
+        *offset = ta->offset;
+        *length = ta->track_rab
+            ? ta->buffer->u.array_buffer->byte_length - ta->offset : ta->length;
+        return js_dup(JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
+    }
+    return JS_GetTypedArrayBuffer(ctx, obj, offset, length, NULL);
 }
 
 static JSValue js_dataview_get_buffer(JSContext *ctx, JSValueConst this_val)

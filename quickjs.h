@@ -1099,6 +1099,14 @@ JS_EXTERN JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
 JS_EXTERN JSValue JS_NewArrayBufferCopy(JSContext *ctx, const uint8_t *buf, size_t len);
 JS_EXTERN void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj);
 JS_EXTERN uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj);
+/* Wrapper extension: atomically exchange a managed, attached, non-shared
+   ArrayBuffer's allocation hook. On success the arguments receive the old hook. */
+JS_EXTERN int JS_ExchangeArrayBufferAllocator(JSContext *ctx, JSValueConst obj,
+    JSReallocArrayBufferDataFunc **realloc_func, void **opaque);
+/* Wrapper extension: retain the backing ArrayBuffer and snapshot the current
+   byte range of an ArrayBuffer, TypedArray or DataView without property access. */
+JS_EXTERN JSValue JS_GetBufferRange(JSContext *ctx, JSValueConst obj,
+    size_t *offset, size_t *length);
 JS_EXTERN bool JS_IsArrayBuffer(JSValueConst obj);
 // returns true or false if obj is an ArrayBuffer, -1 otherwise
 JS_EXTERN int JS_IsImmutableArrayBuffer(JSValueConst obj);
