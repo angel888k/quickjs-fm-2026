@@ -539,6 +539,8 @@ JS_EXTERN void JS_FreeContext(JSContext *s);
 JS_EXTERN JSContext *JS_DupContext(JSContext *ctx);
 JS_EXTERN void *JS_GetContextOpaque(JSContext *ctx);
 JS_EXTERN void JS_SetContextOpaque(JSContext *ctx, void *opaque);
+/* Controls eval and Function string compilation; JS_Eval remains available. */
+JS_EXTERN void JS_SetCanCompileStrings(JSContext *ctx, bool can_compile_strings);
 JS_EXTERN JSRuntime *JS_GetRuntime(JSContext *ctx);
 JS_EXTERN void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj);
 JS_EXTERN JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id);

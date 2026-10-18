@@ -572,6 +572,7 @@ struct JSContext {
        - the prototype of Object.prototype is null (always true as it is immutable)
     */
     uint8_t std_array_prototype : 1;
+    uint8_t can_compile_strings : 1;
 
     JSShape *array_shape;   /* initial shape for Array objects */
     JSShape *arguments_shape;  /* shape for arguments objects */
@@ -2875,6 +2876,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
         return NULL;
     }
     ctx->rt = rt;
+    ctx->can_compile_strings = true;
     list_add_tail(&ctx->link, &rt->context_list);
     for(i = 0; i < rt->class_count; i++)
         ctx->class_proto[i] = JS_NULL;
@@ -2936,6 +2938,11 @@ void *JS_GetContextOpaque(JSContext *ctx)
 void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 {
     ctx->user_opaque = opaque;
+}
+
+void JS_SetCanCompileStrings(JSContext *ctx, bool can_compile_strings)
+{
+    ctx->can_compile_strings = can_compile_strings;
 }
 
 /* set the new value and free the old value after (freeing the value
@@ -38366,6 +38373,13 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
 
     if (!JS_IsString(val))
         return js_dup(val);
+    if (!ctx->can_compile_strings) {
+        ret = JS_MakeError2(ctx, JS_EVAL_ERROR, true,
+                           "string compilation is disabled");
+        if (JS_IsException(ret))
+            return ret;
+        return JS_Throw(ctx, ret);
+    }
     str = JS_ToCStringLen(ctx, &len, val);
     if (!str)
         return JS_EXCEPTION;
