@@ -58622,7 +58622,7 @@ static JSValue js_thisBigIntValue(JSContext *ctx, JSValueConst this_val)
 }
 
 static JSValue js_bigint_toString(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv)
+                                  int argc, JSValueConst *argv, int toLocaleString)
 {
     JSValue val;
     int base;
@@ -58631,7 +58631,7 @@ static JSValue js_bigint_toString(JSContext *ctx, JSValueConst this_val,
     val = js_thisBigIntValue(ctx, this_val);
     if (JS_IsException(val))
         return val;
-    if (argc == 0 || JS_IsUndefined(argv[0])) {
+    if (toLocaleString || argc == 0 || JS_IsUndefined(argv[0])) {
         base = 10;
     } else {
         base = js_get_radix(ctx, argv[0]);
@@ -58761,7 +58761,8 @@ static const JSCFunctionListEntry js_bigint_funcs[] = {
 };
 
 static const JSCFunctionListEntry js_bigint_proto_funcs[] = {
-    JS_CFUNC_DEF("toString", 0, js_bigint_toString ),
+    JS_CFUNC_MAGIC_DEF("toString", 0, js_bigint_toString, 0 ),
+    JS_CFUNC_MAGIC_DEF("toLocaleString", 0, js_bigint_toString, 1 ),
     JS_CFUNC_DEF("valueOf", 0, js_bigint_valueOf ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "BigInt", JS_PROP_CONFIGURABLE ),
 };
