@@ -59709,6 +59709,8 @@ static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val,
                                        JS_CLASS_ARRAY_BUFFER, bs,
                                        realloc_func, opaque,
                                        /*alloc_flag*/false);
+    if (JS_IsException(ret) && realloc_func)
+        realloc_func(ctx->rt, opaque, bs, 0);
 fini:
     if (magic == JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE) {
         if (JS_IsException(ret))
