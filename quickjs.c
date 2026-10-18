@@ -30917,6 +30917,21 @@ typedef enum JSResolveResultEnum {
     JS_RESOLVE_RES_AMBIGUOUS,
 } JSResolveResultEnum;
 
+/* Compare resolved bindings, not the modules that re-export them. Local
+   names are not stored in bytecode, so use the closure slot for JS modules. */
+static bool js_same_export_binding(JSModuleDef *m1, JSExportEntry *me1,
+                                   JSModuleDef *m2, JSExportEntry *me2)
+{
+    if (me1->local_name == JS_ATOM__star_ ||
+        me2->local_name == JS_ATOM__star_) {
+        return me1->local_name == me2->local_name &&
+            m1->req_module_entries[me1->u.req_module_idx].module ==
+            m2->req_module_entries[me2->u.req_module_idx].module;
+    }
+    return m1 == m2 && (m1->init_func ? me1 == me2 :
+                       me1->u.local.var_idx == me2->u.local.var_idx);
+}
+
 static JSResolveResultEnum js_resolve_export1(JSContext *ctx,
                                               JSModuleDef **pmodule,
                                               JSExportEntry **pme,
@@ -30972,8 +30987,8 @@ static JSResolveResultEnum js_resolve_export1(JSContext *ctx,
                     return ret;
                 } else if (ret == JS_RESOLVE_RES_FOUND) {
                     if (*pme != NULL) {
-                        if (*pmodule != res_m ||
-                            res_me->local_name != (*pme)->local_name) {
+                        if (!js_same_export_binding(*pmodule, *pme,
+                                                     res_m, res_me)) {
                             *pmodule = NULL;
                             *pme = NULL;
                             return JS_RESOLVE_RES_AMBIGUOUS;
@@ -31017,59 +31032,15 @@ static JSResolveResultEnum js_resolve_export(JSContext *ctx,
     return ret;
 }
 
-static JSVarRef *js_get_local_export_var_ref1(JSContext *ctx, JSModuleDef *m,
-                                              JSExportEntry *me,
-                                              JSResolveState *s)
+static JSVarRef *js_get_local_export_var_ref(JSModuleDef *m,
+                                             JSExportEntry *me)
 {
     JSVarRef *var_ref = me->u.local.var_ref;
-    int i;
 
     if (!var_ref) {
         JSObject *p = JS_VALUE_GET_OBJ(m->func_obj);
         var_ref = p->u.func.var_refs[me->u.local.var_idx];
     }
-    if (var_ref)
-        return var_ref;
-    /* the slot is a re-exported import whose source is not linked yet: follow
-       the import alias, guarding against re-export cycles like js_resolve_export1 */
-    for(i = 0; i < m->import_entries_count; i++) {
-        JSImportEntry *mi = &m->import_entries[i];
-        JSModuleDef *m1, *res_m;
-        JSExportEntry *res_me;
-
-        if (mi->var_idx != me->u.local.var_idx)
-            continue;
-        if (find_resolve_entry(s, m, mi->import_name) >= 0)
-            return NULL;
-        if (add_resolve_entry(ctx, s, m, mi->import_name) < 0)
-            return NULL;
-        m1 = m->req_module_entries[mi->req_module_idx].module;
-        if (js_resolve_export1(ctx, &res_m, &res_me, m1, mi->import_name, s) ==
-                JS_RESOLVE_RES_FOUND &&
-            res_me->local_name != JS_ATOM__star_)
-            return js_get_local_export_var_ref1(ctx, res_m, res_me, s);
-        break;
-    }
-    return NULL;
-}
-
-/* var_ref of a local export. For a re-exported import the slot is NULL until
-   the source is linked, so follow the import alias; returns NULL if
-   unresolvable (e.g. a re-export cycle with no concrete binding). */
-static JSVarRef *js_get_local_export_var_ref(JSContext *ctx, JSModuleDef *m,
-                                             JSExportEntry *me)
-{
-    JSResolveState ss, *s = &ss;
-    JSVarRef *var_ref;
-    int i;
-
-    s->array = NULL;
-    s->size = 0;
-    s->count = 0;
-    var_ref = js_get_local_export_var_ref1(ctx, m, me, s);
-    for(i = 0; i < s->count; i++)
-        JS_FreeAtom(ctx, s->array[i].name);
-    js_free(ctx, s->array);
     return var_ref;
 }
 
@@ -31283,9 +31254,7 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
                 en->u.module = res_m->req_module_entries[res_me->u.req_module_idx].module;
             } else {
                 en->export_type = EXPORTED_NAME_NORMAL;
-                /* follow the import alias when the slot is NULL (cyclic
-                   re-export of an imported binding) */
-                en->u.var_ref = js_get_local_export_var_ref(ctx, res_m, res_me);
+                en->u.var_ref = js_get_local_export_var_ref(res_m, res_me);
             }
         }
     }
@@ -31656,9 +31625,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                     module_trace(ctx, "namespace from\n");
 
                 } else {
-                    /* follow the import alias when the slot is NULL (cyclic
-                       re-export of an imported binding) */
-                    var_ref = js_get_local_export_var_ref(ctx, res_m, res_me);
+                    var_ref = js_get_local_export_var_ref(res_m, res_me);
                     if (!var_ref) {
                         char buf2[ATOM_GET_STR_BUF_SIZE];
                         char buf3[ATOM_GET_STR_BUF_SIZE];
@@ -37003,7 +36970,7 @@ static __exception int compute_stack_size(JSContext *ctx,
 
 static int add_module_variables(JSContext *ctx, JSFunctionDef *fd)
 {
-    int i, idx;
+    int i, j, idx;
     JSModuleDef *m = fd->module;
     JSExportEntry *me;
     JSGlobalVar *hf;
@@ -37031,6 +36998,18 @@ static int add_module_variables(JSContext *ctx, JSFunctionDef *fd)
                 return -1;
             }
             me->u.local.var_idx = idx;
+            /* ParseModule turns exports of imported bindings into indirect
+               entries, including namespace imports. */
+            for(j = 0; j < m->import_entries_count; j++) {
+                JSImportEntry *mi = &m->import_entries[j];
+                if (mi->var_idx == idx) {
+                    JS_FreeAtom(ctx, me->local_name);
+                    me->local_name = JS_DupAtom(ctx, mi->import_name);
+                    me->export_type = JS_EXPORT_TYPE_INDIRECT;
+                    me->u.req_module_idx = mi->req_module_idx;
+                    break;
+                }
+            }
         }
     }
     return 0;
