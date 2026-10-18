@@ -60282,7 +60282,7 @@ static JSValue js_typed_array_with(JSContext *ctx, JSValueConst this_val,
     JSTypedArray *ta;
     JSArrayBuffer *src_abuf, *abuf;
     int64_t idx;
-    uint32_t len, newlen, copy_len;
+    uint32_t len, newlen, copy_len, i;
     int size_log2;
 
     p = get_typed_array(ctx, this_val);
@@ -60306,7 +60306,7 @@ static JSValue js_typed_array_with(JSContext *ctx, JSValueConst this_val,
     /* re-validate after user code (spec step 9: IsValidIntegerIndex) */
     if (typed_array_is_oob(p)) {
         JS_FreeValue(ctx, val);
-        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+        return JS_ThrowRangeError(ctx, "invalid typed array index");
     }
     newlen = p->u.array.count;
     if (idx < 0 || idx >= newlen) {
@@ -60344,12 +60344,20 @@ static JSValue js_typed_array_with(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     }
 
-    /* copy min(len, newlen) elements from source; rest stays zero */
+    /* Copy surviving elements directly. Missing elements must undergo the
+       destination's normal undefined conversion (NaN, zero or TypeError). */
     if (copy_len > 0) {
         ta = p->u.typed_array;
         src_abuf = ta->buffer->u.array_buffer;
         memcpy(abuf->data, src_abuf->data + ta->offset,
                (size_t)copy_len << size_log2);
+    }
+    for(i = copy_len; i < len; i++) {
+        if (JS_SetPropertyUint32(ctx, arr, i, JS_UNDEFINED) < 0) {
+            JS_FreeValue(ctx, val);
+            JS_FreeValue(ctx, arr);
+            return JS_EXCEPTION;
+        }
     }
 
     if (JS_SetPropertyInt64(ctx, arr, idx, val) < 0) {
