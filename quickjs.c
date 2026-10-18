@@ -27408,6 +27408,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
 
         if (s->token.val == TOK_QUESTION_MARK_DOT) {
             /* optional chaining */
+            if (!(parse_flags & PF_POSTFIX_CALL))
+                return js_parse_error(s, "optional chaining is not allowed in a new expression");
             if (next_token(s))
                 return -1;
             has_optional_chain = true;
@@ -27685,6 +27687,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     break;
                 }
             }
+            accept_lparen = (parse_flags & PF_POSTFIX_CALL) != 0;
             call_type = FUNC_CALL_NORMAL;
         } else if (s->token.val == '.') {
             if (next_token(s))
