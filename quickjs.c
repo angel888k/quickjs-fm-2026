@@ -2553,6 +2553,21 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     return ret;
 }
 
+void JS_DiscardPendingJobs(JSRuntime *rt)
+{
+    JSJobEntry *e;
+    int i;
+
+    assert(!rt->current_stack_frame);
+    while (!list_empty(&rt->job_list)) {
+        e = list_entry(rt->job_list.next, JSJobEntry, link);
+        list_del(&e->link);
+        for(i = 0; i < e->argc; i++)
+            JS_FreeValueRT(rt, e->argv[i]);
+        js_free_rt(rt, e);
+    }
+}
+
 static inline uint32_t atom_get_free(const JSAtomStruct *p)
 {
     return (uintptr_t)p >> 1;
@@ -2639,20 +2654,16 @@ void JS_SetRuntimeInfo(JSRuntime *rt, const char *s)
 
 void JS_FreeRuntime(JSRuntime *rt)
 {
+#ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     struct list_head *el, *el1;
+#endif
     bool leak = false;
     int i;
 
     rt->in_free = true;
     JS_FreeValueRT(rt, rt->current_exception);
 
-    list_for_each_safe(el, el1, &rt->job_list) {
-        JSJobEntry *e = list_entry(el, JSJobEntry, link);
-        for(i = 0; i < e->argc; i++)
-            JS_FreeValueRT(rt, e->argv[i]);
-        js_free_rt(rt, e);
-    }
-    init_list_head(&rt->job_list);
+    JS_DiscardPendingJobs(rt);
 
     JS_RunGC(rt);
 
