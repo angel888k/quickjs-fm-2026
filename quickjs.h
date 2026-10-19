@@ -1298,6 +1298,14 @@ JS_EXTERN JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m);
 /* JS Job support */
 
 typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
+/* Capture returns an owned value or JS_EXCEPTION. Promise reactions capture
+   at registration, not at settlement. FinalizationRegistry cleanup jobs have
+   undefined context. The host enters the queued job's context. */
+typedef JSValue JSJobContextCapture(JSContext *ctx, void *opaque);
+JS_EXTERN void JS_SetJobContextCapture(JSRuntime *rt,
+                                       JSJobContextCapture *capture, void *opaque);
+/* Returns an owned value, or JS_UNDEFINED when no job is pending. */
+JS_EXTERN JSValue JS_GetPendingJobContextValue(JSRuntime *rt);
 JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                             int argc, JSValueConst *argv);
 

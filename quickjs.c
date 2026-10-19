@@ -392,6 +392,8 @@ struct JSRuntime {
     void *host_promise_rejection_tracker_opaque;
 
     struct list_head job_list; /* list of JSJobEntry.link */
+    JSJobContextCapture *job_context_capture;
+    void *job_context_opaque;
     JSValue *kept_objects;
     uint32_t kept_object_count;
     uint32_t kept_object_capacity;
@@ -1080,6 +1082,7 @@ typedef struct JSJobEntry {
     struct list_head link;
     JSContext *ctx;
     JSJobFunc *job_func;
+    JSValue context;
     int argc;
     JSValue argv[];
 } JSJobEntry;
@@ -2491,8 +2494,8 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
 }
 
 /* return 0 if OK, < 0 if exception */
-int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
-                  int argc, JSValueConst *argv)
+static int js_enqueue_job(JSContext *ctx, JSJobFunc *job_func,
+                          int argc, JSValueConst *argv, JSValueConst context)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
@@ -2505,12 +2508,50 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
         return -1;
     e->ctx = ctx;
     e->job_func = job_func;
+    e->context = js_dup(context);
     e->argc = argc;
     for(i = 0; i < argc; i++) {
         e->argv[i] = js_dup(argv[i]);
     }
     list_add_tail(&e->link, &rt->job_list);
     return 0;
+}
+
+static JSValue js_capture_job_context(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    return rt->job_context_capture
+        ? rt->job_context_capture(ctx, rt->job_context_opaque) : JS_UNDEFINED;
+}
+
+int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                  int argc, JSValueConst *argv)
+{
+    JSValue context = js_capture_job_context(ctx);
+    int ret;
+
+    if (JS_IsException(context))
+        return -1;
+    ret = js_enqueue_job(ctx, job_func, argc, argv, context);
+    JS_FreeValue(ctx, context);
+    return ret;
+}
+
+void JS_SetJobContextCapture(JSRuntime *rt, JSJobContextCapture *capture,
+                              void *opaque)
+{
+    rt->job_context_capture = capture;
+    rt->job_context_opaque = opaque;
+}
+
+JSValue JS_GetPendingJobContextValue(JSRuntime *rt)
+{
+    JSJobEntry *e;
+
+    if (list_empty(&rt->job_list))
+        return JS_UNDEFINED;
+    e = list_entry(rt->job_list.next, JSJobEntry, link);
+    return js_dup(e->context);
 }
 
 bool JS_IsJobPending(JSRuntime *rt)
@@ -2545,6 +2586,7 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     list_del(&e->link);
     ctx = e->ctx;
     res = e->job_func(e->ctx, e->argc, vc(e->argv));
+    JS_FreeValue(ctx, e->context);
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
     if (JS_IsException(res))
@@ -2566,6 +2608,7 @@ void JS_DiscardPendingJobs(JSRuntime *rt)
     while (!list_empty(&rt->job_list)) {
         e = list_entry(rt->job_list.next, JSJobEntry, link);
         list_del(&e->link);
+        JS_FreeValueRT(rt, e->context);
         for(i = 0; i < e->argc; i++)
             JS_FreeValueRT(rt, e->argv[i]);
         js_free_rt(rt, e);
@@ -55607,6 +55650,7 @@ typedef struct JSPromiseReactionData {
     struct list_head link; /* not used in promise_reaction_job */
     JSValue resolving_funcs[2];
     JSValue handler;
+    JSValue context;
 } JSPromiseReactionData;
 
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValueConst promise)
@@ -55674,6 +55718,7 @@ static void promise_reaction_data_free(JSRuntime *rt,
     JS_FreeValueRT(rt, rd->resolving_funcs[0]);
     JS_FreeValueRT(rt, rd->resolving_funcs[1]);
     JS_FreeValueRT(rt, rd->handler);
+    JS_FreeValueRT(rt, rd->context);
     js_free_rt(rt, rd);
 }
 
@@ -55777,7 +55822,7 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         args[2] = rd->handler;
         args[3] = js_bool(is_reject);
         args[4] = value;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        js_enqueue_job(ctx, promise_reaction_job, 5, args, rd->context);
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -55986,6 +56031,7 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
             JS_MarkValue(rt, rd->resolving_funcs[0], mark_func);
             JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
             JS_MarkValue(rt, rd->handler, mark_func);
+            JS_MarkValue(rt, rd->context, mark_func);
         }
     }
     JS_MarkValue(rt, s->promise_result, mark_func);
@@ -56565,8 +56611,12 @@ static __exception int perform_promise_then(JSContext *ctx,
 {
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
     JSPromiseReactionData *rd_array[2], *rd;
+    JSValue context;
     int i, j;
 
+    context = js_capture_job_context(ctx);
+    if (JS_IsException(context))
+        return -1;
     rd_array[0] = NULL;
     rd_array[1] = NULL;
     for(i = 0; i < 2; i++) {
@@ -56575,6 +56625,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         if (!rd) {
             if (i == 1)
                 promise_reaction_data_free(ctx->rt, rd_array[0]);
+            JS_FreeValue(ctx, context);
             return -1;
         }
         for(j = 0; j < 2; j++)
@@ -56583,8 +56634,10 @@ static __exception int perform_promise_then(JSContext *ctx,
         if (!JS_IsFunction(ctx, handler))
             handler = JS_UNDEFINED;
         rd->handler = js_dup(handler);
+        rd->context = js_dup(context);
         rd_array[i] = rd;
     }
+    JS_FreeValue(ctx, context);
 
     if (s->promise_state == JS_PROMISE_PENDING) {
         for(i = 0; i < 2; i++)
@@ -56599,7 +56652,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         args[2] = rd->handler;
         args[3] = js_bool(i);
         args[4] = s->promise_result;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        js_enqueue_job(ctx, promise_reaction_job, 5, args, rd->context);
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
     }
@@ -63665,7 +63718,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
                 JSValueConst args[2];
                 args[0] = fre->cb;
                 args[1] = fre->held_val;
-                JS_EnqueueJob(fre->ctx, js_finrec_job, 2, args);
+                js_enqueue_job(fre->ctx, js_finrec_job, 2, args, JS_UNDEFINED);
             }
             js_finrec_free(rt, fre);
             break;
