@@ -392,6 +392,9 @@ struct JSRuntime {
     void *host_promise_rejection_tracker_opaque;
 
     struct list_head job_list; /* list of JSJobEntry.link */
+    JSValue *kept_objects;
+    uint32_t kept_object_count;
+    uint32_t kept_object_capacity;
 
     bool module_normalize_has_attr;
     union {
@@ -2666,6 +2669,7 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     JS_DiscardPendingJobs(rt);
 
+    JS_ClearKeptObjects(rt);
     JS_RunGC(rt);
 
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
@@ -7609,6 +7613,10 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
 
     s->memory_used_count = 2; /* rt + rt->class_array */
     s->memory_used_size = sizeof(JSRuntime) + sizeof(JSClass) * rt->class_count;
+    if (rt->kept_objects) {
+        s->memory_used_count++;
+        s->memory_used_size += (size_t)rt->kept_object_capacity * sizeof(JSValue);
+    }
 
     list_for_each(el, &rt->context_list) {
         JSContext *ctx = list_entry(el, JSContext, link);
@@ -63225,6 +63233,83 @@ static void js_weakref_finalizer(JSRuntime *rt, JSValueConst val)
     js_free_rt(rt, wr);
 }
 
+void JS_ClearKeptObjects(JSRuntime *rt)
+{
+    JSValue *objects = rt->kept_objects;
+    uint32_t capacity = rt->kept_object_capacity;
+    uint32_t i;
+
+    assert(!rt->current_stack_frame);
+    rt->kept_objects = NULL;
+    rt->kept_object_count = 0;
+    rt->kept_object_capacity = 0;
+    for (i = 0; i < capacity; i++)
+        JS_FreeValueRT(rt, objects[i]);
+    js_free_rt(rt, objects);
+}
+
+static uint32_t kept_object_index(JSValueConst value, uint32_t capacity)
+{
+    return hash_uintptr((uintptr_t)JS_VALUE_GET_PTR(value)) & (capacity - 1);
+}
+
+static int js_add_to_kept_objects(JSContext *ctx, JSValueConst value)
+{
+    JSRuntime *rt = ctx->rt;
+    uint32_t capacity = rt->kept_object_capacity;
+    uint32_t index, i;
+    JSValue *objects;
+    JSValue retained;
+
+    if (capacity) {
+        index = kept_object_index(value, capacity);
+        while (!JS_IsUndefined(rt->kept_objects[index])) {
+            if (JS_VALUE_GET_PTR(rt->kept_objects[index]) == JS_VALUE_GET_PTR(value))
+                return 0;
+            index = (index + 1) & (capacity - 1);
+        }
+    }
+    retained = js_dup(value);
+    if (!capacity || rt->kept_object_count >= capacity - capacity / 4) {
+        if (capacity > UINT32_MAX / 2) {
+            JS_FreeValue(ctx, retained);
+            JS_ThrowOutOfMemory(ctx);
+            return -1;
+        }
+        capacity = capacity ? capacity * 2 : 16;
+        if ((uint64_t)capacity * sizeof(*objects) > SIZE_MAX) {
+            JS_FreeValue(ctx, retained);
+            JS_ThrowOutOfMemory(ctx);
+            return -1;
+        }
+        objects = js_malloc(ctx, (size_t)capacity * sizeof(*objects));
+        if (!objects) {
+            JS_FreeValue(ctx, retained);
+            return -1;
+        }
+        for (i = 0; i < capacity; i++)
+            objects[i] = JS_UNDEFINED;
+        for (i = 0; i < rt->kept_object_capacity; i++) {
+            JSValue object = rt->kept_objects[i];
+            if (JS_IsUndefined(object))
+                continue;
+            index = kept_object_index(object, capacity);
+            while (!JS_IsUndefined(objects[index]))
+                index = (index + 1) & (capacity - 1);
+            objects[index] = object;
+        }
+        js_free_rt(rt, rt->kept_objects);
+        rt->kept_objects = objects;
+        rt->kept_object_capacity = capacity;
+    }
+    index = kept_object_index(value, capacity);
+    while (!JS_IsUndefined(rt->kept_objects[index]))
+        index = (index + 1) & (capacity - 1);
+    rt->kept_objects[index] = retained;
+    rt->kept_object_count++;
+    return 0;
+}
+
 static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
                                       int argc, JSValueConst *argv)
 {
@@ -63233,7 +63318,6 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
     JSValueConst arg = argv[0];
     if (!is_valid_weakref_target(arg))
         return JS_ThrowTypeError(ctx, "invalid target");
-    // TODO(saghul): short-circuit if the refcount is 1?
     JSValue obj = js_create_from_ctor(ctx, new_target, JS_CLASS_WEAK_REF);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
@@ -63246,6 +63330,12 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
     if (!wr) {
         JS_FreeValue(ctx, obj);
         js_free(ctx, wrd);
+        return JS_EXCEPTION;
+    }
+    if (js_add_to_kept_objects(ctx, arg) < 0) {
+        JS_FreeValue(ctx, obj);
+        js_free(ctx, wrd);
+        js_free(ctx, wr);
         return JS_EXCEPTION;
     }
     wrd->target = arg;
@@ -63265,6 +63355,8 @@ static JSValue js_weakref_deref(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     if (wrd == &js_weakref_sentinel)
         return JS_UNDEFINED;
+    if (js_add_to_kept_objects(ctx, wrd->target) < 0)
+        return JS_EXCEPTION;
     return js_dup(wrd->target);
 }
 

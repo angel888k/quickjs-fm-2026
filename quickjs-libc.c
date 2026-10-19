@@ -4893,12 +4893,14 @@ int js_std_loop(JSContext *ctx)
             }
         }
 
+        JS_ClearKeptObjects(rt);
         js_std_promise_rejection_check(ctx);
 
         if (!ts->can_js_os_poll || js_os_poll(ctx))
             break;
     }
 done:
+    JS_ClearKeptObjects(rt);
     return JS_HasException(ctx);
 }
 
@@ -4919,6 +4921,7 @@ int js_std_loop_once(JSContext *ctx)
     }
 
     /* run at most one expired timer */
+    JS_ClearKeptObjects(rt);
     if (js_os_run_timers(rt, ctx, ts, &min_delay) < 0)
         return -2; /* error in timer callback */
 
@@ -4926,6 +4929,7 @@ int js_std_loop_once(JSContext *ctx)
     if (JS_IsJobPending(rt))
         return 0; /* more microtasks pending */
 
+    JS_ClearKeptObjects(rt);
     if (min_delay == 0)
         return 0; /* timer ready to fire immediately */
 
@@ -4962,8 +4966,10 @@ JSValue js_std_await(JSContext *ctx, JSValue obj)
             if (err < 0) {
                 js_std_dump_error(ctx1);
             }
-            if (err == 0)
+            if (err == 0) {
+                JS_ClearKeptObjects(JS_GetRuntime(ctx));
                 js_std_promise_rejection_check(ctx);
+            }
             if (ts->can_js_os_poll)
                 js_os_poll(ctx);
         } else {
