@@ -1101,6 +1101,7 @@ JS_EXTERN JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
                                     JSReallocArrayBufferDataFunc *realloc_func,
                                     void *opaque, bool is_shared);
 JS_EXTERN JSValue JS_NewArrayBufferCopy(JSContext *ctx, const uint8_t *buf, size_t len);
+JS_EXTERN void JS_SetArrayBufferDetachable(JSContext *ctx, JSValueConst obj, bool detachable);
 JS_EXTERN void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj);
 JS_EXTERN uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj);
 /* Wrapper extension: atomically exchange a managed, attached, non-shared

@@ -637,6 +637,7 @@ typedef enum {
     JS_WEAK_REF_KIND_MAP,
     JS_WEAK_REF_KIND_WEAK_REF,
     JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY,
+    JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_TOKEN,
 } JSWeakRefKindEnum;
 
 typedef struct JSWeakRefRecord {
@@ -948,6 +949,7 @@ typedef struct JSArrayBuffer {
     int byte_length; /* 0 if detached */
     int max_byte_length; /* -1 if not resizable; >= byte_length otherwise */
     uint8_t detached;
+    uint8_t transfer_protected;
     uint8_t immutable;
     uint8_t shared; /* if shared, the array buffer cannot be detached */
     uint8_t *data; /* NULL if detached */
@@ -59329,6 +59331,7 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
     }
     init_list_head(&abuf->array_list);
     abuf->detached = false;
+    abuf->transfer_protected = false;
     abuf->immutable = false;
     abuf->shared = (class_id == JS_CLASS_SHARED_ARRAY_BUFFER);
     abuf->opaque = opaque;
@@ -59574,6 +59577,13 @@ static JSValue js_array_buffer_get_resizable(JSContext *ctx,
     return js_bool(array_buffer_is_resizable(abuf));
 }
 
+void JS_SetArrayBufferDetachable(JSContext *ctx, JSValueConst obj, bool detachable)
+{
+    JSArrayBuffer *abuf = JS_GetOpaque(obj, JS_CLASS_ARRAY_BUFFER);
+    if (abuf)
+        abuf->transfer_protected = !detachable;
+}
+
 void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj)
 {
     JSArrayBuffer *abuf = JS_GetOpaque(obj, JS_CLASS_ARRAY_BUFFER);
@@ -59751,6 +59761,8 @@ static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (abuf->immutable)
         return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+    if (abuf->transfer_protected)
+        return JS_ThrowTypeError(ctx, "array buffer is not transferable");
     if (abuf->detached)
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
     pmax_len = NULL;
@@ -63453,10 +63465,29 @@ static void delete_finrec_weakref(JSRuntime *rt, JSFinRecEntry *fre)
     js_free_rt(rt, wr);
 }
 
+static void delete_finrec_token_weakref(JSRuntime *rt, JSFinRecEntry *fre)
+{
+    JSWeakRefRecord **pwr, *wr;
+
+    if (JS_IsUndefined(fre->token))
+        return;
+    pwr = get_first_weak_ref(fre->token);
+    for (;;) {
+        wr = *pwr;
+        assert(wr != NULL);
+        if (wr->kind == JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_TOKEN &&
+            wr->u.fin_rec_entry == fre)
+            break;
+        pwr = &wr->next_weak_ref;
+    }
+    *pwr = wr->next_weak_ref;
+    fre->token = JS_UNDEFINED;
+    js_free_rt(rt, wr);
+}
+
 static void js_finrec_free(JSRuntime *rt, JSFinRecEntry *fre)
 {
     JS_FreeValueRT(rt, fre->held_val);
-    JS_FreeValueRT(rt, fre->token);
     JS_FreeValueRT(rt, fre->cb);
     JS_FreeContext(fre->ctx);
     js_free_rt(rt, fre);
@@ -63472,6 +63503,7 @@ static void js_finrec_finalizer(JSRuntime *rt, JSValueConst val)
         list_for_each_safe(el, el1, &frd->entries) {
             JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
             delete_finrec_weakref(rt, fre);
+            delete_finrec_token_weakref(rt, fre);
         }
         /* second pass to actually free all objects. */
         list_for_each_safe(el, el1, &frd->entries) {
@@ -63494,7 +63526,6 @@ static void js_finrec_mark(JSRuntime *rt, JSValueConst val,
         list_for_each(el, &frd->entries) {
             JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
             JS_MarkValue(rt, fre->held_val, mark_func);
-            JS_MarkValue(rt, fre->token, mark_func);
             JS_MarkValue(rt, fre->cb, mark_func);
             mark_func(rt, &fre->ctx->header);
         }
@@ -63553,15 +63584,29 @@ static JSValue js_finrec_register(JSContext *ctx, JSValueConst this_val,
         js_free(ctx, fre);
         return JS_EXCEPTION;
     }
+    JSWeakRefRecord *token_wr = NULL;
+    if (!JS_IsUndefined(token)) {
+        token_wr = js_malloc(ctx, sizeof(*token_wr));
+        if (!token_wr) {
+            js_free(ctx, wr);
+            js_free(ctx, fre);
+            return JS_EXCEPTION;
+        }
+    }
     fre->cb = js_dup(frd->cb);
     fre->ctx = JS_DupContext(frd->ctx);
     fre->target = target;
     fre->held_val = js_dup(held_val);
-    fre->token = js_dup(token);
+    fre->token = token;
     list_add_tail(&fre->link, &frd->entries);
     wr->kind = JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY;
     wr->u.fin_rec_entry = fre;
     insert_weakref_record(target, wr);
+    if (token_wr) {
+        token_wr->kind = JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_TOKEN;
+        token_wr->u.fin_rec_entry = fre;
+        insert_weakref_record(token, token_wr);
+    }
 
     return JS_UNDEFINED;
 }
@@ -63577,15 +63622,23 @@ static JSValue js_finrec_unregister(JSContext *ctx, JSValueConst this_val, int a
         return JS_ThrowTypeError(ctx, "invalid unregister token");
 
     struct list_head *el, *el1;
+    struct list_head removed_entries;
     bool removed = false;
+    init_list_head(&removed_entries);
     list_for_each_safe(el, el1, &frd->entries) {
         JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
         if (js_same_value(ctx, fre->token, token)) {
             list_del(&fre->link);
             delete_finrec_weakref(ctx->rt, fre);
-            js_finrec_free(ctx->rt, fre);
+            delete_finrec_token_weakref(ctx->rt, fre);
+            list_add_tail(&fre->link, &removed_entries);
             removed = true;
         }
+    }
+    list_for_each_safe(el, el1, &removed_entries) {
+        JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
+        list_del(&fre->link);
+        js_finrec_free(ctx->rt, fre);
     }
 
     return js_bool(removed);
@@ -63670,6 +63723,10 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
             wrd = wr->u.weak_ref_data;
             wrd->target = JS_UNDEFINED;
             break;
+        case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_TOKEN:
+            fre = wr->u.fin_rec_entry;
+            fre->token = JS_UNDEFINED;
+            break;
         case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY:
             fre = wr->u.fin_rec_entry;
             list_del(&fre->link);
@@ -63693,6 +63750,8 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
             wrd = wr->u.weak_ref_data;
             JS_SetOpaqueInternal(wrd->obj, &js_weakref_sentinel);
             js_free_rt(rt, wrd);
+            break;
+        case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_TOKEN:
             break;
         case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY: {
             fre = wr->u.fin_rec_entry;
@@ -63720,6 +63779,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
                 args[1] = fre->held_val;
                 js_enqueue_job(fre->ctx, js_finrec_job, 2, args, JS_UNDEFINED);
             }
+            delete_finrec_token_weakref(rt, fre);
             js_finrec_free(rt, fre);
             break;
         }
