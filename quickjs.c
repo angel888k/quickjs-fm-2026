@@ -17424,9 +17424,8 @@ static __exception int js_append_enumerate(JSContext *ctx, JSValue *sp)
     is_array_iterator = JS_IsCFunction(ctx, iterator,
                                        ft.generic,
                                        JS_ITERATOR_KIND_VALUE);
+    enumobj = JS_GetIterator2(ctx, sp[-1], iterator);
     JS_FreeValue(ctx, iterator);
-
-    enumobj = JS_GetIterator(ctx, sp[-1], false);
     if (JS_IsException(enumobj))
         return -1;
     method = JS_GetProperty(ctx, enumobj, JS_ATOM_next);
@@ -43238,6 +43237,7 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
     this_arg = JS_UNDEFINED;
     r = JS_UNDEFINED;
     arrayLike = JS_UNDEFINED;
+    iter = JS_UNDEFINED;
     stack[0] = JS_UNDEFINED;
     stack[1] = JS_UNDEFINED;
 
@@ -43254,16 +43254,20 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
     iter = JS_GetProperty(ctx, items, JS_ATOM_Symbol_iterator);
     if (JS_IsException(iter))
         goto exception;
-    if (!JS_IsUndefined(iter)) {
-        JS_FreeValue(ctx, iter);
+    if (!JS_IsUndefined(iter) && !JS_IsNull(iter)) {
+        if (check_function(ctx, iter))
+            goto exception;
         if (JS_IsConstructor(ctx, this_val))
             r = JS_CallConstructor(ctx, this_val, 0, NULL);
         else
             r = JS_NewArray(ctx);
         if (JS_IsException(r))
             goto exception;
-        stack[0] = js_dup(items);
-        if (js_for_of_start(ctx, &stack[1], false))
+        stack[0] = JS_GetIterator2(ctx, items, iter);
+        if (JS_IsException(stack[0]))
+            goto exception;
+        stack[1] = JS_GetProperty(ctx, stack[0], JS_ATOM_next);
+        if (JS_IsException(stack[1]))
             goto exception;
         for (k = 0;; k++) {
             v = JS_IteratorNext(ctx, stack[0], stack[1], 0, NULL, &done);
@@ -43329,6 +43333,7 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(ctx, r);
     r = JS_EXCEPTION;
  done:
+    JS_FreeValue(ctx, iter);
     JS_FreeValue(ctx, arrayLike);
     JS_FreeValue(ctx, stack[0]);
     JS_FreeValue(ctx, stack[1]);
