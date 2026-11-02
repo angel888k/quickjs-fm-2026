@@ -1109,10 +1109,12 @@ JS_EXTERN uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst
 JS_EXTERN int JS_ExchangeArrayBufferAllocator(JSContext *ctx, JSValueConst obj,
     JSReallocArrayBufferDataFunc **realloc_func, void **opaque);
 /* Wrapper extension: retain the backing ArrayBuffer and snapshot the current
-   byte range of an ArrayBuffer, TypedArray or DataView without property access. */
+   byte range of an ArrayBuffer, SharedArrayBuffer, TypedArray or DataView
+   without property access. */
 JS_EXTERN JSValue JS_GetBufferRange(JSContext *ctx, JSValueConst obj,
     size_t *offset, size_t *length);
 JS_EXTERN bool JS_IsArrayBuffer(JSValueConst obj);
+JS_EXTERN bool JS_IsSharedArrayBuffer(JSValueConst obj);
 // returns true or false if obj is an ArrayBuffer, -1 otherwise
 JS_EXTERN int JS_IsImmutableArrayBuffer(JSValueConst obj);
 // returns 0 if obj is an ArrayBuffer, -1 otherwise
@@ -1146,6 +1148,32 @@ JS_EXTERN JSValue JS_NewUint8Array(JSContext *ctx, uint8_t *buf, size_t len,
 /* returns -1 if not a typed array otherwise return a JSTypedArrayEnum value */
 JS_EXTERN int JS_GetTypedArrayType(JSValueConst obj);
 JS_EXTERN JSValue JS_NewUint8ArrayCopy(JSContext *ctx, const uint8_t *buf, size_t len);
+/* Atomic memory shared with an embedding. The caller owns the allocation and
+   validates its bounds and natural alignment. Width is 1, 2, 4 or 8 bytes;
+   wait accepts only 4 or 8 bytes. Operations are sequentially consistent and
+   use the same wait queues as JavaScript Atomics. */
+typedef enum JSAtomicMemoryOperation {
+    JS_ATOMIC_ADD,
+    JS_ATOMIC_AND,
+    JS_ATOMIC_OR,
+    JS_ATOMIC_SUB,
+    JS_ATOMIC_XOR,
+    JS_ATOMIC_EXCHANGE,
+    JS_ATOMIC_COMPARE_EXCHANGE,
+    JS_ATOMIC_LOAD,
+    JS_ATOMIC_STORE,
+} JSAtomicMemoryOperation;
+typedef int JSAtomicWaitCheck(void *opaque);
+/* Wait results: 0 notified, 1 not equal, 2 timed out, 3 interrupted.
+   A negative timeout means no deadline. check may be NULL; otherwise it must
+   return nonzero to interrupt, and must not free the memory being waited on. */
+JS_EXTERN uint64_t JS_AtomicMemoryOp(void *ptr, unsigned width,
+    JSAtomicMemoryOperation operation, uint64_t value, uint64_t replacement);
+JS_EXTERN void JS_AtomicMemoryFence(void);
+JS_EXTERN int JS_AtomicMemoryWait(void *ptr, unsigned width, int64_t expected,
+    int64_t timeout_ns, JSAtomicWaitCheck *check, void *opaque);
+JS_EXTERN uint32_t JS_AtomicMemoryNotify(void *ptr, uint32_t count);
+
 typedef struct {
     void *(*sab_alloc)(void *opaque, size_t size);
     void (*sab_free)(void *opaque, void *ptr);

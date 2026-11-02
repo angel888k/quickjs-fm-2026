@@ -59311,8 +59311,10 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
             sab_alloc_len = max_len ? *max_len : len;
             abuf->data = rt->sab_funcs.sab_alloc(rt->sab_funcs.sab_opaque,
                                                  max_int(sab_alloc_len, 1));
-            if (!abuf->data)
+            if (!abuf->data) {
+                JS_ThrowOutOfMemory(ctx);
                 goto fail;
+            }
             memset(abuf->data, 0, sab_alloc_len);
         } else {
             /* the allocation must be done after the object creation */
@@ -59393,6 +59395,11 @@ JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
     return js_array_buffer_constructor3(ctx, JS_UNDEFINED, len, pmax_len,
                                         class_id, buf, realloc_func, opaque,
                                         false);
+}
+
+bool JS_IsSharedArrayBuffer(JSValueConst obj)
+{
+    return JS_GetClassID(obj) == JS_CLASS_SHARED_ARRAY_BUFFER;
 }
 
 bool JS_IsArrayBuffer(JSValueConst obj) {
@@ -62268,7 +62275,7 @@ JSValue JS_GetBufferRange(JSContext *ctx, JSValueConst obj,
 {
     JSObject *p;
     JSTypedArray *ta;
-    if (JS_IsArrayBuffer(obj)) {
+    if (JS_IsArrayBuffer(obj) || JS_IsSharedArrayBuffer(obj)) {
         JS_GetArrayBuffer(ctx, length, obj);
         if (JS_HasException(ctx))
             return JS_EXCEPTION;
@@ -62626,15 +62633,130 @@ int JS_GetTypedArrayType(JSValueConst obj)
 #ifdef CONFIG_ATOMICS
 
 typedef enum AtomicsOpEnum {
-    ATOMICS_OP_ADD,
-    ATOMICS_OP_AND,
-    ATOMICS_OP_OR,
-    ATOMICS_OP_SUB,
-    ATOMICS_OP_XOR,
-    ATOMICS_OP_EXCHANGE,
-    ATOMICS_OP_COMPARE_EXCHANGE,
-    ATOMICS_OP_LOAD,
+    ATOMICS_OP_ADD = JS_ATOMIC_ADD,
+    ATOMICS_OP_AND = JS_ATOMIC_AND,
+    ATOMICS_OP_OR = JS_ATOMIC_OR,
+    ATOMICS_OP_SUB = JS_ATOMIC_SUB,
+    ATOMICS_OP_XOR = JS_ATOMIC_XOR,
+    ATOMICS_OP_EXCHANGE = JS_ATOMIC_EXCHANGE,
+    ATOMICS_OP_COMPARE_EXCHANGE = JS_ATOMIC_COMPARE_EXCHANGE,
+    ATOMICS_OP_LOAD = JS_ATOMIC_LOAD,
 } AtomicsOpEnum;
+
+uint64_t JS_AtomicMemoryOp(void *ptr, unsigned width,
+                         JSAtomicMemoryOperation op, uint64_t v, uint64_t rep_val)
+{
+    uint64_t a;
+    unsigned size_log2;
+
+    switch (width) {
+    case 1:
+        size_log2 = 0;
+        break;
+    case 2:
+        size_log2 = 1;
+        break;
+    case 4:
+        size_log2 = 2;
+        break;
+    case 8:
+        size_log2 = 3;
+        break;
+    default:
+        abort();
+    }
+    assert(((uintptr_t)ptr & (width - 1)) == 0);
+    if (op == JS_ATOMIC_STORE) {
+        switch (width) {
+        case 1:
+            atomic_store((_Atomic uint8_t *)ptr, v);
+            break;
+        case 2:
+            atomic_store((_Atomic uint16_t *)ptr, v);
+            break;
+        case 4:
+            atomic_store((_Atomic uint32_t *)ptr, v);
+            break;
+        case 8:
+            atomic_store((_Atomic uint64_t *)ptr, v);
+            break;
+        }
+        return v;
+    }
+    switch(op | (size_log2 << 3)) {
+
+#define OP(op_name, func_name)                          \
+    case ATOMICS_OP_ ## op_name | (0 << 3):             \
+       a = func_name((_Atomic uint8_t *)ptr, v);        \
+       break;                                           \
+    case ATOMICS_OP_ ## op_name | (1 << 3):             \
+        a = func_name((_Atomic uint16_t *)ptr, v);      \
+        break;                                          \
+    case ATOMICS_OP_ ## op_name | (2 << 3):             \
+        a = func_name((_Atomic uint32_t *)ptr, v);      \
+        break;                                          \
+    case ATOMICS_OP_ ## op_name | (3 << 3):             \
+        a = func_name((_Atomic uint64_t *)ptr, v);      \
+        break;
+        OP(ADD, atomic_fetch_add)
+        OP(AND, atomic_fetch_and)
+        OP(OR, atomic_fetch_or)
+        OP(SUB, atomic_fetch_sub)
+        OP(XOR, atomic_fetch_xor)
+        OP(EXCHANGE, atomic_exchange)
+#undef OP
+
+    case ATOMICS_OP_LOAD | (0 << 3):
+        a = atomic_load((_Atomic uint8_t *)ptr);
+        break;
+    case ATOMICS_OP_LOAD | (1 << 3):
+        a = atomic_load((_Atomic uint16_t *)ptr);
+        break;
+    case ATOMICS_OP_LOAD | (2 << 3):
+        a = atomic_load((_Atomic uint32_t *)ptr);
+        break;
+    case ATOMICS_OP_LOAD | (3 << 3):
+        a = atomic_load((_Atomic uint64_t *)ptr);
+        break;
+    case ATOMICS_OP_COMPARE_EXCHANGE | (0 << 3):
+        {
+            uint8_t v1 = v;
+            atomic_compare_exchange_strong((_Atomic uint8_t *)ptr, &v1, rep_val);
+            a = v1;
+        }
+        break;
+    case ATOMICS_OP_COMPARE_EXCHANGE | (1 << 3):
+        {
+            uint16_t v1 = v;
+            atomic_compare_exchange_strong((_Atomic uint16_t *)ptr, &v1, rep_val);
+            a = v1;
+        }
+        break;
+    case ATOMICS_OP_COMPARE_EXCHANGE | (2 << 3):
+        {
+            uint32_t v1 = v;
+            atomic_compare_exchange_strong((_Atomic uint32_t *)ptr, &v1, rep_val);
+            a = v1;
+        }
+        break;
+    case ATOMICS_OP_COMPARE_EXCHANGE | (3 << 3):
+        {
+            uint64_t v1 = v;
+            atomic_compare_exchange_strong((_Atomic uint64_t *)ptr, &v1, rep_val);
+            a = v1;
+        }
+        break;
+    default:
+        abort();
+    }
+
+    return a;
+}
+
+void JS_AtomicMemoryFence(void)
+{
+    atomic_thread_fence(memory_order_seq_cst);
+}
 
 static JSObject *js_atomics_get_buf(JSContext *ctx,
                                     JSValueConst obj, JSValueConst idx_val,
@@ -62734,72 +62856,8 @@ static JSValue js_atomics_op(JSContext *ctx,
 
     ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
 
-   switch(op | (size_log2 << 3)) {
-
-#define OP(op_name, func_name)                          \
-    case ATOMICS_OP_ ## op_name | (0 << 3):             \
-       a = func_name((_Atomic uint8_t *)ptr, v);        \
-       break;                                           \
-    case ATOMICS_OP_ ## op_name | (1 << 3):             \
-        a = func_name((_Atomic uint16_t *)ptr, v);      \
-        break;                                          \
-    case ATOMICS_OP_ ## op_name | (2 << 3):             \
-        a = func_name((_Atomic uint32_t *)ptr, v);      \
-        break;                                          \
-    case ATOMICS_OP_ ## op_name | (3 << 3):             \
-        a = func_name((_Atomic uint64_t *)ptr, v);      \
-        break;
-        OP(ADD, atomic_fetch_add)
-        OP(AND, atomic_fetch_and)
-        OP(OR, atomic_fetch_or)
-        OP(SUB, atomic_fetch_sub)
-        OP(XOR, atomic_fetch_xor)
-        OP(EXCHANGE, atomic_exchange)
-#undef OP
-
-    case ATOMICS_OP_LOAD | (0 << 3):
-        a = atomic_load((_Atomic uint8_t *)ptr);
-        break;
-    case ATOMICS_OP_LOAD | (1 << 3):
-        a = atomic_load((_Atomic uint16_t *)ptr);
-        break;
-    case ATOMICS_OP_LOAD | (2 << 3):
-        a = atomic_load((_Atomic uint32_t *)ptr);
-        break;
-    case ATOMICS_OP_LOAD | (3 << 3):
-        a = atomic_load((_Atomic uint64_t *)ptr);
-        break;
-    case ATOMICS_OP_COMPARE_EXCHANGE | (0 << 3):
-        {
-            uint8_t v1 = v;
-            atomic_compare_exchange_strong((_Atomic uint8_t *)ptr, &v1, rep_val);
-            a = v1;
-        }
-        break;
-    case ATOMICS_OP_COMPARE_EXCHANGE | (1 << 3):
-        {
-            uint16_t v1 = v;
-            atomic_compare_exchange_strong((_Atomic uint16_t *)ptr, &v1, rep_val);
-            a = v1;
-        }
-        break;
-    case ATOMICS_OP_COMPARE_EXCHANGE | (2 << 3):
-        {
-            uint32_t v1 = v;
-            atomic_compare_exchange_strong((_Atomic uint32_t *)ptr, &v1, rep_val);
-            a = v1;
-        }
-        break;
-    case ATOMICS_OP_COMPARE_EXCHANGE | (3 << 3):
-        {
-            uint64_t v1 = v;
-            atomic_compare_exchange_strong((_Atomic uint64_t *)ptr, &v1, rep_val);
-            a = v1;
-        }
-        break;
-    default:
-        abort();
-    }
+    a = JS_AtomicMemoryOp(ptr, 1U << size_log2,
+                          (JSAtomicMemoryOperation)op, v, rep_val);
 
     switch(p->class_id) {
     case JS_CLASS_INT8_ARRAY:
@@ -62919,6 +62977,94 @@ static js_mutex_t js_atomics_mutex;
 static struct list_head js_atomics_waiter_list =
     LIST_HEAD_INIT(js_atomics_waiter_list);
 
+static void js__atomics_init(void);
+
+int JS_AtomicMemoryWait(void *ptr, unsigned width, int64_t expected,
+                        int64_t timeout_ns, JSAtomicWaitCheck *check, void *opaque)
+{
+    JSAtomicsWaiter waiter;
+    uint64_t started = js__hrtime_ns();
+    uint64_t elapsed, remaining;
+    int result = 0, interrupted;
+
+    assert(width == 4 || width == 8);
+    assert(((uintptr_t)ptr & (width - 1)) == 0);
+    js_once(&js_atomics_once, js__atomics_init);
+    js_mutex_lock(&js_atomics_mutex);
+    if (JS_AtomicMemoryOp(ptr, width, JS_ATOMIC_LOAD, 0, 0) !=
+        (width == 4 ? (uint32_t)expected : (uint64_t)expected)) {
+        js_mutex_unlock(&js_atomics_mutex);
+        return 1;
+    }
+    waiter.ptr = ptr;
+    waiter.linked = true;
+    js_cond_init(&waiter.cond);
+    list_add_tail(&waiter.link, &js_atomics_waiter_list);
+    while (waiter.linked) {
+        if (check) {
+            js_mutex_unlock(&js_atomics_mutex);
+            interrupted = check(opaque);
+            js_mutex_lock(&js_atomics_mutex);
+            if (interrupted) {
+                result = 3;
+                break;
+            }
+            if (!waiter.linked)
+                break;
+        }
+        remaining = UINT64_MAX;
+        if (timeout_ns >= 0) {
+            elapsed = js__hrtime_ns() - started;
+            if (elapsed >= (uint64_t)timeout_ns) {
+                result = 2;
+                break;
+            }
+            remaining = (uint64_t)timeout_ns - elapsed;
+        }
+        /* Keep the waiter queued while polling host cancellation. Only notify
+           removes it, so a timed check cannot lose a wakeup or recheck value. */
+        if (check && remaining > 10000000)
+            remaining = 10000000;
+        if (remaining == UINT64_MAX)
+            js_cond_wait(&waiter.cond, &js_atomics_mutex);
+        else
+            js_cond_timedwait(&waiter.cond, &js_atomics_mutex, remaining);
+    }
+    if (waiter.linked)
+        list_del(&waiter.link);
+    js_mutex_unlock(&js_atomics_mutex);
+    js_cond_destroy(&waiter.cond);
+    return result;
+}
+
+uint32_t JS_AtomicMemoryNotify(void *ptr, uint32_t count)
+{
+    struct list_head *el, *next;
+    JSAtomicsWaiter *waiter;
+    uint32_t notified = 0;
+
+    js_once(&js_atomics_once, js__atomics_init);
+    js_mutex_lock(&js_atomics_mutex);
+    list_for_each_safe(el, next, &js_atomics_waiter_list) {
+        if (notified == count)
+            break;
+        waiter = list_entry(el, JSAtomicsWaiter, link);
+        if (waiter->ptr == ptr) {
+            list_del(&waiter->link);
+            waiter->linked = false;
+            js_cond_signal(&waiter->cond);
+            notified++;
+        }
+    }
+    js_mutex_unlock(&js_atomics_mutex);
+    return notified;
+}
+
+static int js_atomics_interrupt(void *opaque)
+{
+    return __js_poll_interrupts(opaque);
+}
+
 // no-op: Atomics.pause() is not allowed to block or yield to another
 // thread, only to hint the CPU that it should back off for a bit;
 // the amount of work we do here is a good enough substitute
@@ -62955,8 +63101,7 @@ static JSValue js_atomics_wait(JSContext *ctx,
     int64_t timeout;
     uint64_t idx;
     JSObject *p;
-    JSAtomicsWaiter waiter_s, *waiter;
-    int ret, size_log2, res;
+    int ret, size_log2;
     double d;
 
     p = js_atomics_get_buf(ctx, argv[0], argv[1], NULL, &idx, 2);
@@ -62973,12 +63118,14 @@ static JSValue js_atomics_wait(JSContext *ctx,
     }
     if (JS_ToFloat64(ctx, &d, argv[3]))
         return JS_EXCEPTION;
-    if (isnan(d) || d >= 0x1p63)
-        timeout = INT64_MAX;
+    if (isnan(d) || d == INFINITY)
+        timeout = -1;
     else if (d < 0)
         timeout = 0;
+    else if (d >= (double)INT64_MAX / 1000000)
+        timeout = INT64_MAX;
     else
-        timeout = (int64_t)d;
+        timeout = (int64_t)(d * 1000000);
     if (!ctx->rt->can_block)
         return JS_ThrowTypeError(ctx, "cannot block in this thread");
 
@@ -62988,47 +63135,18 @@ static JSValue js_atomics_wait(JSContext *ctx,
 
     ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
 
-    /* XXX: inefficient if large number of waiters, should hash on
-       'ptr' value */
-    js_mutex_lock(&js_atomics_mutex);
-    if (size_log2 == 3) {
-        res = *(int64_t *)ptr != v;
-    } else {
-        res = *(int32_t *)ptr != v;
-    }
-    if (res) {
-        js_mutex_unlock(&js_atomics_mutex);
-        return JS_AtomToString(ctx, JS_ATOM_not_equal);
-    }
-
-    waiter = &waiter_s;
-    waiter->ptr = ptr;
-    js_cond_init(&waiter->cond);
-    waiter->linked = true;
-    list_add_tail(&waiter->link, &js_atomics_waiter_list);
-
-    if (timeout == INT64_MAX) {
-        js_cond_wait(&waiter->cond, &js_atomics_mutex);
-        ret = 0;
-    } else {
-        ret = js_cond_timedwait(&waiter->cond, &js_atomics_mutex, timeout * 1e6 /* to ns */);
-    }
-    if (waiter->linked)
-        list_del(&waiter->link);
-    js_mutex_unlock(&js_atomics_mutex);
-    js_cond_destroy(&waiter->cond);
-    if (ret == -1) {
-        return JS_AtomToString(ctx, JS_ATOM_timed_out);
-    } else {
-        return JS_AtomToString(ctx, JS_ATOM_ok);
-    }
+    ret = JS_AtomicMemoryWait(ptr, 1U << size_log2, v, timeout,
+                              js_atomics_interrupt, ctx);
+    if (ret == 3)
+        return JS_EXCEPTION;
+    return JS_AtomToString(ctx, ret == 0 ? JS_ATOM_ok :
+                          ret == 1 ? JS_ATOM_not_equal : JS_ATOM_timed_out);
 }
 
 static JSValue js_atomics_notify(JSContext *ctx,
                                  JSValueConst this_obj,
                                  int argc, JSValueConst *argv)
 {
-    struct list_head *el, *el1, waiter_list;
     int size_log2;
     int count;
     int32_t n;
@@ -63036,7 +63154,6 @@ static JSValue js_atomics_notify(JSContext *ctx,
     uint64_t idx;
     JSObject *p;
     JSArrayBuffer *abuf;
-    JSAtomicsWaiter *waiter;
 
     p = js_atomics_get_buf(ctx, argv[0], argv[1], &abuf, &idx, 1);
     if (!p)
@@ -63057,25 +63174,7 @@ static JSValue js_atomics_notify(JSContext *ctx,
     n = 0;
     if (abuf->shared && count > 0) {
         ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
-
-        js_mutex_lock(&js_atomics_mutex);
-        init_list_head(&waiter_list);
-        list_for_each_safe(el, el1, &js_atomics_waiter_list) {
-            waiter = list_entry(el, JSAtomicsWaiter, link);
-            if (waiter->ptr == ptr) {
-                list_del(&waiter->link);
-                waiter->linked = false;
-                list_add_tail(&waiter->link, &waiter_list);
-                n++;
-                if (n >= count)
-                    break;
-            }
-        }
-        list_for_each(el, &waiter_list) {
-            waiter = list_entry(el, JSAtomicsWaiter, link);
-            js_cond_signal(&waiter->cond);
-        }
-        js_mutex_unlock(&js_atomics_mutex);
+        n = JS_AtomicMemoryNotify(ptr, count);
     }
     return js_int32(n);
 }
